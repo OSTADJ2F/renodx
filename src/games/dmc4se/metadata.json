@@ -1,0 +1,16 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "dmc4se",
+  "title": "Devil May Cry 4 Special Edition",
+  "status": "experimental",
+  "compatibility": "unknown",
+  "summary": "Development scaffold; HDR support has not been established.",
+  "deploy": {
+    "game_exe": "DevilMayCry4SpecialEdition.exe",
+    "process_name": "DevilMayCry4SpecialEdition.exe",
+    "api": "d3d10",
+    "architecture": ["x86"],
+    "steam_appid": 329050,
+    "reshade_preferred_name": "dxgi.dll"
+  }
+}

@@ -1,0 +1,14 @@
+#include "./tonemap_reinhard.hlsli"
+
+Texture2D<float4> tFilterLinear3 : register(t2);
+Texture2D<float4> tFilterLinear2 : register(t3);
+
+void main(
+  float4 v0 : SV_Position0,
+  float4 v1 : TEXCOORD0,
+  out float4 o0 : SV_TARGET0)
+{
+  float3 bloom = gXfScaleColor.y * tFilterLinear3.Sample(SSLinear_s, v1.xy).xyz + gXfScaleColor.z * tFilterLinear2.Sample(SSLinear_s, v1.xy).xyz;
+  o0.xyz = ReinhardTonemap(v1.xy, bloom);
+  o0.w = 1;
+}
