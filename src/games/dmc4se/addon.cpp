@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,7 @@
 #include "../../utils/device_proxy.hpp"
 #include "../../utils/platform.hpp"
 #include "../../utils/settings.hpp"
+#include "../../utils/swapchain.hpp"
 #include "../../utils/vtable.hpp"
 #include "./shared.h"
 #include "./ui.hpp"
@@ -1097,6 +1099,31 @@ void OnInitSwapChain(reshade::api::swapchain* swapchain, bool /*resize*/) {
   InstallOutputGammaHooks(reinterpret_cast<IDXGISwapChain*>(swapchain->get_native()));
 }
 
+bool fired_on_init_peak_nits = false;
+
+// Registered in both output modes. Runs once, on the game's own D3D10 swapchain; the DevKit proxy is D3D11.
+void OnInitSwapChainPeakNits(reshade::api::swapchain* swapchain, bool /*resize*/) {
+  if (fired_on_init_peak_nits) return;
+  if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d10) return;
+  fired_on_init_peak_nits = true;
+
+  const auto peak = renodx::utils::swapchain::GetPeakNits(swapchain);
+  if (!peak.has_value()) return;
+
+  auto* peak_setting = settings_ui::FindSetting("ToneMapPeakNits");
+  if (peak_setting == nullptr) return;
+  const float peak_nits = std::round(peak.value());
+  peak_setting->default_value = peak_nits;
+  peak_setting->can_reset = true;
+
+  // Presets load before the swapchain exists, so a missing key means the default was never saved.
+  if (settings_ui::preset_index == 0) return;
+  float saved_peak_nits = 0.f;
+  if (!reshade::get_config_value(nullptr, settings_ui::GetCurrentPresetName().c_str(), "ToneMapPeakNits", saved_peak_nits)) {
+    settings_ui::UpdateSetting("ToneMapPeakNits", peak_nits);
+  }
+}
+
 void OnDestroySwapChain(reshade::api::swapchain* swapchain, bool resize) {
   if (resize || swapchain->get_device()->get_api() != reshade::api::device_api::d3d10) return;
   CloseProxyOutputWindow(true);
@@ -1255,6 +1282,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         const bool use_device_proxy = output_mode_setting->GetValue() == 1.f;
         renodx::mods::swapchain::use_device_proxy = use_device_proxy;
         renodx::mods::swapchain::set_color_space = !use_device_proxy;
+        reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapChainPeakNits);
         if (use_device_proxy) {
           reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapChain);
           reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapChain);
@@ -1288,6 +1316,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       break;
     case DLL_PROCESS_DETACH:
+      reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapChainPeakNits);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapChain);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapChain);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
