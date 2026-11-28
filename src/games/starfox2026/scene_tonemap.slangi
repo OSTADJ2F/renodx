@@ -1,0 +1,96 @@
+#ifndef RENODX_STARFOX2026_SCENE_TONEMAP_SLANGI
+#define RENODX_STARFOX2026_SCENE_TONEMAP_SLANGI
+
+#include "./shared.h"
+#include "./sdr_curve.slangi"
+#include "../../shaders/tonemap/psychov/test35.hlsl"
+
+// Measured vanilla neutral curve (LUT probe): 0.18 scRGB (1.0 = 80 nits) -> 32.4 nits,
+// log-log slope 1.14 at mid-grey. Cone exponent and compression are fitted (RMS log2 0.038
+// over 0.005-64 scRGB at peak 1056) to the measured vanilla curve; mid-grey stays on 32.4 nits. Output is in units of game white; anchor_out is
+// referenced to 203 nits so the Game Brightness slider scales the whole image.
+static const float STARFOX_VANILLA_MIDGRAY_IN = 0.18f;
+static const float STARFOX_VANILLA_MIDGRAY_OUT = 32.4f / 203.f;
+static const float STARFOX_VANILLA_SLOPE = 1.197f;
+static const float STARFOX_VANILLA_COMPRESSION = 1.654f;
+
+// Placeholder: buffer value of UI white, to be set from a measurement. UI nits = rgb * UI Brightness / this.
+static const float STARFOX_UI_WHITE_VALUE = 1.3f;  // Measured: opaque UI white in the scene buffer (main menu p90-p99 1.2-1.33).
+
+// Game SDR reference: the game's SDR tonemap (measured grey ramp) applied per channel to the scene. Display-relative linear BT.709.
+// Valid up to scene ~1 (above it the game clips toward white), so ApplyReferenceHueChroma hands off to the Game HDR reference near the clip.
+float3 SampleSdrCurve(float3 scene) {
+  float3 t = clamp((log2(max(scene, 1e-30f)) - STARFOX_SDR_CURVE_LOG2_MIN) / (STARFOX_SDR_CURVE_LOG2_MAX - STARFOX_SDR_CURVE_LOG2_MIN), 0.f, 1.f) * float(STARFOX_SDR_CURVE_SIZE - 1);
+  int3 i0 = min(int3(t), int3(STARFOX_SDR_CURVE_SIZE - 2));
+  float3 f = t - float3(i0);
+  return float3(
+    lerp(STARFOX_SDR_CURVE[i0.x], STARFOX_SDR_CURVE[i0.x + 1], f.x),
+    lerp(STARFOX_SDR_CURVE[i0.y], STARFOX_SDR_CURVE[i0.y + 1], f.y),
+    lerp(STARFOX_SDR_CURVE[i0.z], STARFOX_SDR_CURVE[i0.z + 1], f.z));
+}
+
+// Reference colour: Game HDR = the game's display LUT output on the same scene value (PQ BT.2020);
+// Game SDR = the measured SDR curve on the scene, handing off to Game HDR as it nears its clip.
+// Lightness stays from PsychoV35; hue and chroma (relative to lightness) come from the reference in Oklab.
+// Oklab (constant matrices only) is used instead of ICtCp: ICtCp inverts a static matrix at runtime, which returned 0 under Slang.
+// Gamut-agnostic: the reference may be outside BT.709, so negatives are kept (Oklab uses a sign-preserving cube root) and clamped only after the BT.2020 conversion.
+// Strengths are 0-100. Colour Reference 0 = PsychoV35 only (no reference).
+float3 ApplyReferenceHueChroma(float3 mapped_bt709, float3 scene, float3 reference_pq, float diffuse_white) {
+  float hue_strength = saturate(RENODX_HUE_STRENGTH * 0.01f);
+  float chroma_strength = saturate(RENODX_CHROMA_STRENGTH * 0.01f);
+  if (RENODX_COLOR_REFERENCE == RENODX_COLOR_REFERENCE_PSYCHOV35 || (hue_strength == 0.f && chroma_strength == 0.f)) return mapped_bt709;
+
+  float3 psycho_lab = renodx::color::oklab::from::BT709(mapped_bt709);
+  if (!(psycho_lab.x > 1e-6f)) return mapped_bt709;
+
+  // Reference (a, b) per unit lightness.
+  float3 hdr_lab = renodx::color::oklab::from::BT709(renodx::color::bt709::from::BT2020(renodx::color::pq::Decode(reference_pq, diffuse_white)));
+  float2 reference_ab = hdr_lab.yz / max(hdr_lab.x, 1e-6f);
+  float hdr_chroma = length(hdr_lab.yz);
+  bool reference_valid = hdr_chroma > 1e-6f && hdr_lab.x > 1e-6f;
+  if (RENODX_COLOR_REFERENCE == RENODX_COLOR_REFERENCE_GAME_SDR) {
+    float3 sdr = SampleSdrCurve(scene);
+    float3 sdr_lab = renodx::color::oklab::from::BT709(sdr);
+    float handoff = smoothstep(0.85f, 0.98f, max(sdr.x, max(sdr.y, sdr.z)));
+    if (length(sdr_lab.yz) > 1e-6f && sdr_lab.x > 1e-6f) {
+      reference_ab = reference_valid ? lerp(sdr_lab.yz / sdr_lab.x, reference_ab, handoff) : sdr_lab.yz / sdr_lab.x;
+      reference_valid = true;
+    }
+  }
+  float reference_chroma = length(reference_ab);
+  if (!reference_valid || !(reference_chroma > 1e-6f)) return mapped_bt709;
+
+  float psycho_chroma = length(psycho_lab.yz);
+  float2 reference_dir = reference_ab / reference_chroma;
+  float2 hue_dir = psycho_chroma > 1e-6f ? lerp(psycho_lab.yz / psycho_chroma, reference_dir, hue_strength) : reference_dir;
+  float hue_len = length(hue_dir);
+  hue_dir = hue_len > 1e-4f ? hue_dir / hue_len : reference_dir;
+
+  // Reference chroma per unit lightness, applied to PsychoV35's lightness.
+  float target_chroma = reference_chroma * psycho_lab.x;
+  float chroma = lerp(psycho_chroma, target_chroma, chroma_strength);
+
+  return renodx::color::bt709::from::OkLab(float3(psycho_lab.x, hue_dir * chroma));
+}
+
+// scene: sanitized linear BT.709 buffer (1.0 = 80 nits); coverage: UI alpha (0 where no UI).
+// reference_pq: the game's display LUT output for the same scene value (PQ BT.2020).
+// Scene is tonemapped, UI is scaled linearly, then blended by coverage. Returns PQ-encoded BT.2020.
+float3 ApplyPsychoV35PQ(float3 scene, float coverage, float3 reference_pq) {
+    float diffuse_white = RENODX_DIFFUSE_WHITE_NITS;
+    float peak_white = max(RENODX_PEAK_WHITE_NITS, diffuse_white);
+    float3 mapped = renodx::tonemap::psychov::psychotm_test35(
+        scene,
+        peak_white / diffuse_white,
+        1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 100.f, 1.f, 1.f, 0,
+        STARFOX_VANILLA_SLOPE,
+        float3(STARFOX_VANILLA_MIDGRAY_IN, STARFOX_VANILLA_MIDGRAY_IN, STARFOX_VANILLA_MIDGRAY_IN),
+        float3(STARFOX_VANILLA_MIDGRAY_OUT, STARFOX_VANILLA_MIDGRAY_OUT, STARFOX_VANILLA_MIDGRAY_OUT),
+        1.f, 1, 1.f, STARFOX_VANILLA_COMPRESSION);
+  mapped = ApplyReferenceHueChroma(mapped, scene, reference_pq, diffuse_white);
+  float3 scene_nits = max(renodx::color::bt2020::from::BT709(mapped), float3(0.f, 0.f, 0.f)) * diffuse_white;
+  float3 ui_nits = max(renodx::color::bt2020::from::BT709(scene), float3(0.f, 0.f, 0.f)) * (RENODX_UI_NITS / STARFOX_UI_WHITE_VALUE);
+  return renodx::color::pq::Encode(lerp(scene_nits, ui_nits, saturate(coverage)) / 10000.f);
+}
+
+#endif

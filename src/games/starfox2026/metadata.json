@@ -1,0 +1,11 @@
+{
+  "$schema": "https://cdn.jsdelivr.net/gh/clshortfuse/renodx/renodx-metadata-schema.json",
+  "id": "starfox2026",
+  "title": "Star Fox for Switch 2",
+  "status": "experimental",
+  "deploy": {
+    "api": "vulkan",
+    "architecture": ["x64"],
+    "game_exe": "lichii.exe"
+  }
+}
